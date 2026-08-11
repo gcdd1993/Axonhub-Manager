@@ -4,13 +4,20 @@ use std::{
     io::Cursor,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
 };
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Manager, State};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    AppHandle, Manager, State, WindowEvent,
+};
 
 const DEFAULT_CONFIG: &str = r#"server:
   host: "127.0.0.1"
@@ -111,6 +118,7 @@ struct AppState {
     root: PathBuf,
     client: reqwest::Client,
     runtime: Mutex<Runtime>,
+    shutting_down: AtomicBool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,6 +183,7 @@ impl AppState {
                 last_error: None,
                 logs,
             }),
+            shutting_down: AtomicBool::new(false),
         })
     }
 
@@ -221,6 +230,17 @@ impl AppState {
             message: message.clone(),
         });
         message
+    }
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        if let Ok(runtime) = self.runtime.get_mut() {
+            if let Some(child) = runtime.child.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
 }
 
@@ -429,12 +449,6 @@ async fn check_updates(state: State<'_, AppState>) -> Result<Snapshot> {
 
 #[tauri::command]
 async fn install_latest(state: State<'_, AppState>) -> Result<Snapshot> {
-    {
-        let runtime = state.runtime.lock().expect("runtime mutex poisoned");
-        if runtime.child.is_some() {
-            return Err("升级前请先停止 AxonHub".into());
-        }
-    }
     state.set_busy(true, Some(5), Some("读取最新 Release"));
     {
         state
@@ -501,6 +515,7 @@ async fn install_latest(state: State<'_, AppState>) -> Result<Snapshot> {
             sha256: actual,
             installed_at: Utc::now().to_rfc3339(),
         };
+        stop_managed_process(&state)?;
         let mut runtime = state.runtime.lock().expect("runtime mutex poisoned");
         if let Some(current) = runtime.installed.take() {
             write_manifest(&state.root.join("previous.json"), &current)?;
@@ -520,13 +535,18 @@ async fn install_latest(state: State<'_, AppState>) -> Result<Snapshot> {
     .await;
     state.set_busy(false, None, None);
     if let Err(error) = result {
-        return Err(state.fail(error));
+        let error = state.fail(error);
+        let _ = start_if_installed(&state).await;
+        return Err(error);
     }
+    start_managed_process(&state).await?;
     Ok(snapshot(&state).await)
 }
 
-#[tauri::command]
-async fn start_axonhub(state: State<'_, AppState>) -> Result<Snapshot> {
+async fn start_managed_process(state: &AppState) -> Result<()> {
+    if state.shutting_down.load(Ordering::SeqCst) {
+        return Err("应用正在退出，已取消启动 AxonHub".into());
+    }
     let already_running = state
         .runtime
         .lock()
@@ -534,7 +554,7 @@ async fn start_axonhub(state: State<'_, AppState>) -> Result<Snapshot> {
         .child
         .is_some();
     if already_running {
-        return Ok(snapshot(&state).await);
+        return Ok(());
     }
     let executable = {
         let mut runtime = state.runtime.lock().expect("runtime mutex poisoned");
@@ -566,11 +586,23 @@ async fn start_axonhub(state: State<'_, AppState>) -> Result<Snapshot> {
     }
     state.log("info", format!("AxonHub 已启动，PID {pid}，等待健康检查"));
     tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-    Ok(snapshot(&state).await)
+    Ok(())
 }
 
-#[tauri::command]
-async fn stop_axonhub(state: State<'_, AppState>) -> Result<Snapshot> {
+async fn start_if_installed(state: &AppState) -> Result<()> {
+    let is_installed = state
+        .runtime
+        .lock()
+        .expect("runtime mutex poisoned")
+        .installed
+        .is_some();
+    if is_installed {
+        start_managed_process(state).await?;
+    }
+    Ok(())
+}
+
+fn stop_managed_process(state: &AppState) -> Result<()> {
     let child = {
         state
             .runtime
@@ -579,12 +611,19 @@ async fn stop_axonhub(state: State<'_, AppState>) -> Result<Snapshot> {
             .child
             .take()
     };
-    if let Some(mut child) = child {
+    let stopped_process = if let Some(mut child) = child {
+        let pid = child.id();
+        state.log("info", format!("正在停止 AxonHub，PID {pid}"));
         child
             .kill()
             .map_err(|error| state.fail(format!("停止进程失败：{error}")))?;
-        let _ = child.wait();
-    }
+        child
+            .wait()
+            .map_err(|error| state.fail(format!("等待 AxonHub 退出失败：{error}")))?;
+        true
+    } else {
+        false
+    };
     {
         let mut runtime = state.runtime.lock().expect("runtime mutex poisoned");
         runtime.lifecycle = if runtime.installed.is_some() {
@@ -594,17 +633,23 @@ async fn stop_axonhub(state: State<'_, AppState>) -> Result<Snapshot> {
         };
         runtime.last_error = None;
     }
-    state.log("info", "AxonHub 已停止");
-    Ok(snapshot(&state).await)
+    if stopped_process {
+        state.log("info", "AxonHub 已停止");
+    }
+    Ok(())
 }
 
 #[tauri::command]
 async fn rollback_version(state: State<'_, AppState>) -> Result<Snapshot> {
     {
-        let mut runtime = state.runtime.lock().expect("runtime mutex poisoned");
-        if runtime.child.is_some() {
-            return Err("回滚前请先停止 AxonHub".into());
+        let runtime = state.runtime.lock().expect("runtime mutex poisoned");
+        if runtime.previous.is_none() {
+            return Err("没有可回滚的历史版本".into());
         }
+    }
+    stop_managed_process(&state)?;
+    let result: Result<()> = (|| {
+        let mut runtime = state.runtime.lock().expect("runtime mutex poisoned");
         let previous = runtime.previous.take().ok_or("没有可回滚的历史版本")?;
         if let Some(current) = runtime.installed.replace(previous.clone()) {
             runtime.previous = Some(current);
@@ -619,7 +664,13 @@ async fn rollback_version(state: State<'_, AppState>) -> Result<Snapshot> {
             level: "warn".into(),
             message: format!("已回滚到 {}", previous.version),
         });
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = start_if_installed(&state).await;
+        return Err(error);
     }
+    start_managed_process(&state).await?;
     Ok(snapshot(&state).await)
 }
 
@@ -654,22 +705,19 @@ fn validate_yaml(content: &str) -> Result<()> {
 #[tauri::command]
 async fn save_config(content: String, state: State<'_, AppState>) -> Result<Snapshot> {
     validate_yaml(&content)?;
-    if state
-        .runtime
-        .lock()
-        .expect("runtime mutex poisoned")
-        .child
-        .is_some()
-    {
-        return Err("保存配置前请停止 AxonHub，避免运行状态与文件不一致".into());
-    }
     let original = fs::read_to_string(state.config_path()).unwrap_or_default();
-    fs::write(state.config_path(), &content).map_err(|error| error.to_string())?;
+    stop_managed_process(&state)?;
+    if let Err(error) = fs::write(state.config_path(), &content) {
+        let _ = start_if_installed(&state).await;
+        return Err(error.to_string());
+    }
     if let Err(error) = validate_with_binary(&state) {
         let _ = fs::write(state.config_path(), original);
+        let _ = start_if_installed(&state).await;
         return Err(error);
     }
     state.log("info", "config.yml 已保存并通过校验");
+    start_if_installed(&state).await?;
     Ok(snapshot(&state).await)
 }
 
@@ -727,19 +775,91 @@ async fn open_log_directory(state: State<'_, AppState>) -> Result<Snapshot> {
     Ok(snapshot(&state).await)
 }
 
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn request_shutdown(app: AppHandle) {
+    let state = app.state::<AppState>();
+    if state
+        .shutting_down
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        if let Err(error) = stop_managed_process(&state) {
+            state.log("error", format!("退出时停止 AxonHub 失败：{error}"));
+        }
+        drop(state);
+        app.exit(0);
+    });
+}
+
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
         .setup(|app| {
             let state = AppState::new(app.handle()).map_err(std::io::Error::other)?;
             app.manage(state);
+
+            let show_item =
+                MenuItem::with_id(app, "show", "显示 AxonHub Manager", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let mut tray = TrayIconBuilder::with_id("main")
+                .menu(&menu)
+                .tooltip("AxonHub Manager")
+                .show_menu_on_left_click(false)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "show" => show_main_window(app),
+                    "quit" => request_shutdown(app.clone()),
+                    _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(
+                        event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } | TrayIconEvent::DoubleClick {
+                            button: MouseButton::Left,
+                            ..
+                        }
+                    ) {
+                        show_main_window(tray.app_handle());
+                    }
+                });
+            if let Some(icon) = app.default_window_icon() {
+                tray = tray.icon(icon.clone());
+            }
+            tray.build(app)?;
+
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = app_handle.state::<AppState>();
+                if let Err(error) = start_if_installed(&state).await {
+                    state.fail(format!("自动启动 AxonHub 失败：{error}"));
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
             check_updates,
             install_latest,
-            start_axonhub,
-            stop_axonhub,
             rollback_version,
             read_config,
             save_config,
@@ -748,6 +868,16 @@ pub fn run() {
             open_data_directory,
             open_log_directory
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running AxonHub Manager");
+        .build(tauri::generate_context!())
+        .expect("error while building AxonHub Manager");
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            let state = app_handle.state::<AppState>();
+            if !state.shutting_down.load(Ordering::SeqCst) {
+                api.prevent_exit();
+                drop(state);
+                request_shutdown(app_handle.clone());
+            }
+        }
+    });
 }

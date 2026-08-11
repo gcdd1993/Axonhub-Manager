@@ -1,0 +1,156 @@
+name: Build and Release AxonHub Manager
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Verify
+    if: ${{ github.event_name != 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Validate version files
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          $packageVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $packageLock = Get-Content package-lock.json -Raw | ConvertFrom-Json -AsHashtable
+          $packageLockVersion = $packageLock['version']
+          $rootPackageLockVersion = $packageLock['packages']['']['version']
+          $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoVersion = [regex]::Match((Get-Content src-tauri/Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
+          $cargoLockVersion = [regex]::Match((Get-Content src-tauri/Cargo.lock -Raw), '(?ms)^name = "axonhub-manager"\r?\nversion = "([^"]+)"').Groups[1].Value
+          if (@($packageVersion, $packageLockVersion, $rootPackageLockVersion, $tauriVersion, $cargoVersion, $cargoLockVersion) | Where-Object { $_ -ne $version }) {
+            throw "Version mismatch: VERSION=$version, package=$packageVersion, package-lock=$packageLockVersion/$rootPackageLockVersion, Tauri=$tauriVersion, Cargo=$cargoVersion, Cargo.lock=$cargoLockVersion"
+          }
+
+      - name: Check Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+
+      - name: Check Rust backend
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Test Rust backend
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Build frontend
+        run: npm run build
+
+  publish-windows:
+    name: Package Windows x64
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare release metadata
+        id: release
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          $packageVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $packageLock = Get-Content package-lock.json -Raw | ConvertFrom-Json -AsHashtable
+          $packageLockVersion = $packageLock['version']
+          $rootPackageLockVersion = $packageLock['packages']['']['version']
+          $tauriVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoVersion = [regex]::Match((Get-Content src-tauri/Cargo.toml -Raw), '(?m)^version = "([^"]+)"').Groups[1].Value
+          $cargoLockVersion = [regex]::Match((Get-Content src-tauri/Cargo.lock -Raw), '(?ms)^name = "axonhub-manager"\r?\nversion = "([^"]+)"').Groups[1].Value
+          if (@($packageVersion, $packageLockVersion, $rootPackageLockVersion, $tauriVersion, $cargoVersion, $cargoLockVersion) | Where-Object { $_ -ne $version }) {
+            throw "Version mismatch: VERSION=$version, package=$packageVersion, package-lock=$packageLockVersion/$rootPackageLockVersion, Tauri=$tauriVersion, Cargo=$cargoVersion, Cargo.lock=$cargoLockVersion"
+          }
+          if ('${{ github.ref_type }}' -eq 'tag' -and '${{ github.ref_name }}' -ne "v$version") {
+            throw "Tag ${{ github.ref_name }} does not match VERSION $version"
+          }
+
+          $changelog = Get-Content CHANGELOG.md -Raw
+          $escapedVersion = [regex]::Escape($version)
+          $match = [regex]::Match($changelog, "(?ms)^## \[$escapedVersion\].*?(?=^## \[|\z)")
+          $body = if ($match.Success) {
+            $match.Value.Trim()
+          } else {
+            "Automated Windows x64 NSIS bundle for AxonHub Manager v$version. The installer is unsigned."
+          }
+          $delimiter = "RELEASE_NOTES_$([guid]::NewGuid().ToString('N'))"
+          "body<<$delimiter" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $body | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $delimiter | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Test Rust backend
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Build and upload Windows installer
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tauriScript: npm run tauri
+          args: "--bundles nsis"
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'axonhub-manager-v__VERSION__' }}
+          releaseName: ${{ github.ref_type == 'tag' && format('AxonHub Manager {0}', github.ref_name) || 'AxonHub Manager v__VERSION__' }}
+          releaseBody: ${{ steps.release.outputs.body }}
+          releaseDraft: ${{ github.ref_type != 'tag' }}
+          prerelease: false
+          uploadWorkflowArtifacts: true
+          releaseAssetNamePattern: "[mainBinaryName]_[version]_[platform]_[arch][setup][ext]"

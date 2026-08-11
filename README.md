@@ -1,20 +1,47 @@
 # AxonHub Manager
 
-一个使用 Tauri 2、Rust、React 和 TypeScript 编写的 AxonHub 本地桌面管理器。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-它负责 AxonHub 二进制的安装、SHA-256 校验、升级、回滚、进程控制、健康检查、配置编辑与日志查看；渠道、模型、API Key、请求追踪等业务管理继续使用 AxonHub 自带的 Web 管理后台。
+![Version](https://img.shields.io/badge/version-0.0.1-blue)
+![Platform](https://img.shields.io/badge/platform-Windows-0078D4)
+![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB)
+![Rust](https://img.shields.io/badge/Rust-2021-000000)
+![React](https://img.shields.io/badge/React-19-61DAFB)
 
-## 功能
+AxonHub Manager is a Windows desktop lifecycle manager for [AxonHub](https://github.com/looplj/axonhub). It installs and validates AxonHub releases, owns the AxonHub process, and provides a focused interface for configuration, health, logs, upgrades, and rollback.
 
-- 查询 `looplj/axonhub` 最新 GitHub Release，并自动匹配当前平台资产
-- 下载后验证 GitHub Release 提供的 SHA-256 digest
-- 保留上一安装版本，支持停止状态下一键回滚
-- 启动、停止并监控 AxonHub，本地健康检查地址为 `/health`
-- 编辑 `config.yml`，执行 YAML 基础检查与 `axonhub config validate`
-- 聚合管理器事件和 AxonHub 标准输出日志
-- 深色/浅色主题、键盘焦点、减少动态效果等可访问性支持
+AxonHub's built-in web console remains the place to manage channels, models, API keys, and request tracing.
 
-默认数据目录由 Tauri 的应用数据目录决定，其中包含：
+## Features
+
+- Fetch the latest release from `looplj/axonhub` and select the matching Windows x64 asset.
+- Verify the release SHA-256 digest when the upstream release provides one.
+- Keep the previous installed version for one-click rollback.
+- Start AxonHub automatically with the desktop application.
+- Stop AxonHub before the application exits so no managed process is left behind.
+- Keep running in the system tray; the window close button hides the application instead of exiting.
+- Monitor the AxonHub process and its `/health` endpoint.
+- Edit `config.yml` with YAML checks and `axonhub config validate`.
+- Restart the managed process automatically after configuration changes, upgrades, or rollback.
+- View Manager events and AxonHub standard output in one log interface.
+- Use dark or light themes with keyboard and reduced-motion accessibility support.
+
+## Installation
+
+Download the latest Windows x64 installer from [GitHub Releases](https://github.com/gcdd1993/Axonhub-Manager/releases).
+
+The current installer is unsigned. Windows SmartScreen may display a warning until code signing is configured. Verify that downloads come from this repository before running them.
+
+## Runtime Behavior
+
+AxonHub Manager owns the AxonHub process lifecycle:
+
+1. If AxonHub is installed, opening Manager starts it automatically.
+2. Clicking the window close button hides Manager to the system tray while AxonHub keeps running.
+3. Left-clicking the tray icon restores the window.
+4. Choosing **Exit** from the tray stops AxonHub, waits for it to exit, and then closes Manager.
+
+The application stores its managed files in the operating system application data directory:
 
 ```text
 config.yml
@@ -25,32 +52,63 @@ versions/
 logs/axonhub.log
 ```
 
-## 开发
+## Requirements
 
-```bash
-npm install
+- Windows 10 or later, x64
+- Microsoft Edge WebView2 Runtime
+- Network access to GitHub when installing or checking AxonHub releases
+
+## Development
+
+Install dependencies and start the Tauri application:
+
+```powershell
+npm ci
 npm run tauri -- dev
 ```
 
-只构建前端：
+Run the same checks used by CI:
 
-```bash
+```powershell
 npm run build
-```
-
-检查 Rust：
-
-```bash
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 cargo check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml --lib
 ```
 
-## 设计原则
+Build the Windows NSIS installer:
 
-界面采用高信息密度的开发者工具布局，以状态、版本、安全边界和恢复路径为首要层级。设计规范保存在 `design-system/axonhub-manager/MASTER.md`。
+```powershell
+npm run tauri -- build --bundles nsis
+```
 
-## 上游项目
+The installer is written to `src-tauri/target/release/bundle/nsis/`.
 
-- [AxonHub](https://github.com/looplj/axonhub)
-- 功能边界参考 [CPA-Manager-native](https://github.com/gcdd1993/CPA-Manager-native)
+## Releases
 
+Pull requests and pushes to `master` run frontend and Rust verification. A tag matching `v*` builds the Windows x64 NSIS installer and publishes it to GitHub Releases. A manual workflow run creates a draft release.
+
+Before tagging a release:
+
+1. Update `VERSION`, `package.json`, `package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and `src-tauri/tauri.conf.json` to the same version.
+2. Move the release notes from **Unreleased** into a dated section in `CHANGELOG.md`.
+3. Commit the changes and push a matching tag, for example `v0.0.1`.
+
+The workflow rejects inconsistent versions and tags.
+
+## Technology
+
+- Tauri 2
+- Rust 2021
+- React 19 and TypeScript
+- Vite 6
+
+## Upstream and Scope
+
+- [AxonHub](https://github.com/looplj/axonhub) is the upstream service managed by this application.
+- AxonHub Manager is an independent desktop companion and is not an official AxonHub distribution.
+- The product boundary was informed by [CPA-Manager-native](https://github.com/gcdd1993/CPA-Manager-native).
+
+## License
+
+No license file is currently included. All rights remain with their respective owners unless a license is added.

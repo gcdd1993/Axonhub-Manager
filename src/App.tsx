@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  Activity, ArrowUpRight, CheckCircle2, ChevronRight, CircleAlert, CircleStop,
+  Activity, ArrowUpRight, CheckCircle2, ChevronRight, CircleAlert,
   Code2, Download, ExternalLink, FileCode2, FolderOpen, Gauge, Github, HardDrive,
-  LayoutDashboard, LoaderCircle, Moon, Play, RefreshCw, RotateCcw, Save, Server,
+  LayoutDashboard, LoaderCircle, Moon, RefreshCw, RotateCcw, Save, Server,
   Settings, ShieldCheck, SquareTerminal, Sun, Workflow,
 } from "lucide-react";
 import { getSnapshot, readConfig, run, saveConfig } from "./api";
@@ -52,9 +52,7 @@ export default function App() {
   if (!snapshot) return <div className="boot"><LoaderCircle className="spin" />正在连接本地控制平面…</div>;
 
   const installed = Boolean(snapshot.installed_version);
-  const running = snapshot.lifecycle === "running";
-  const primary = !installed ? "install_latest" : snapshot.update_available ? "install_latest" : running ? "stop_axonhub" : "start_axonhub";
-  const primaryLabel = !installed ? "安装 AxonHub" : snapshot.update_available ? "升级到最新版本" : running ? "停止服务" : "启动服务";
+  const installLabel = !installed ? "安装 AxonHub" : "升级到最新版本";
 
   return <div className="shell">
     <a className="skip-link" href="#main">跳到主要内容</a>
@@ -73,16 +71,16 @@ export default function App() {
       <header className="topbar"><div><span className="kicker">LOCAL AI CONTROL PLANE</span><h1>{view === "overview" ? "运行概览" : view === "config" ? "AxonHub 配置" : view === "logs" ? "运行日志" : "应用设置"}</h1></div><div className="top-actions">
         <button className="icon-btn" aria-label="切换主题" title="切换主题" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun /> : <Moon />}</button>
         <button className="secondary" disabled={Boolean(pending)} onClick={() => action("check_updates")}><RefreshCw className={pending === "check_updates" ? "spin" : ""} />检查版本</button>
-        <button className={running ? "danger" : "primary"} disabled={snapshot.busy || Boolean(pending)} onClick={() => action(primary)}>{snapshot.busy ? <LoaderCircle className="spin" /> : running ? <CircleStop /> : installed ? <Play /> : <Download />}{primaryLabel}</button>
+        {(!installed || snapshot.update_available) && <button className="primary" disabled={snapshot.busy || Boolean(pending)} onClick={() => action("install_latest")}>{snapshot.busy ? <LoaderCircle className="spin" /> : <Download />}{installLabel}</button>}
       </div></header>
 
       {error && <div className="error-banner" role="alert"><CircleAlert /><span>{error}</span><button aria-label="关闭" onClick={() => setError(null)}>×</button></div>}
 
       {view === "overview" && <>
         <section className="hero-card">
-          <div className="hero-copy"><div className="hero-icon"><Server /></div><div><div className="eyebrow">AXONHUB INSTANCE</div><h2>{snapshot.healthy ? "网关运行稳定" : installed ? "实例已就绪，等待启动" : "部署你的本地 AI 网关"}</h2><p>统一管理 OpenAI、Anthropic、Gemini 等协议的本地接入入口。</p></div></div>
+          <div className="hero-copy"><div className="hero-icon"><Server /></div><div><div className="eyebrow">AXONHUB INSTANCE</div><h2>{snapshot.healthy ? "网关运行稳定" : installed ? "实例正在由 Manager 托管" : "部署你的本地 AI 网关"}</h2><p>统一管理 OpenAI、Anthropic、Gemini 等协议的本地接入入口。</p></div></div>
           <Status snapshot={snapshot} />
-          <div className="hero-actions"><button className="secondary" disabled={!snapshot.healthy} onClick={() => action("open_management")}><ExternalLink />打开管理后台</button><button className="icon-btn" disabled={!snapshot.previous_version || running} title="回滚上一版本" aria-label="回滚上一版本" onClick={() => action("rollback_version")}><RotateCcw /></button></div>
+          <div className="hero-actions"><button className="secondary" disabled={!snapshot.healthy} onClick={() => action("open_management")}><ExternalLink />打开管理后台</button><button className="icon-btn" disabled={!snapshot.previous_version || snapshot.busy} title="回滚上一版本" aria-label="回滚上一版本" onClick={() => action("rollback_version")}><RotateCcw /></button></div>
         </section>
 
         {snapshot.busy && <div className="progress-card"><div><span>{snapshot.progress_label ?? "处理中"}</span><strong>{snapshot.progress_percent ?? 0}%</strong></div><div className="progress-track"><i style={{ width: `${snapshot.progress_percent ?? 3}%` }} /></div></div>}
