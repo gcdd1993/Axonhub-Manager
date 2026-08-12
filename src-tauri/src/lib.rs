@@ -18,6 +18,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Manager, State, WindowEvent,
 };
+use tauri_plugin_autostart::ManagerExt;
 
 const DEFAULT_CONFIG: &str = r#"server:
   host: "127.0.0.1"
@@ -99,6 +100,7 @@ struct Snapshot {
     progress_label: Option<String>,
     last_error: Option<String>,
     logs: Vec<LogEntry>,
+    autostart_enabled: bool,
 }
 
 struct Runtime {
@@ -115,10 +117,17 @@ struct Runtime {
 }
 
 struct AppState {
-    root: PathBuf,
+    app_handle: AppHandle,
+    root: Mutex<PathBuf>,
+    settings_path: PathBuf,
     client: reqwest::Client,
     runtime: Mutex<Runtime>,
     shutting_down: AtomicBool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ManagerSettings {
+    data_directory: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,10 +151,21 @@ struct HealthResponse {
 
 impl AppState {
     fn new(app: &AppHandle) -> Result<Self> {
-        let root = app
+        let default_root = app
             .path()
             .app_data_dir()
             .map_err(|error| error.to_string())?;
+        let settings_directory = app
+            .path()
+            .app_config_dir()
+            .map_err(|error| error.to_string())?;
+        fs::create_dir_all(&settings_directory).map_err(|error| error.to_string())?;
+        let settings_path = settings_directory.join("manager-settings.json");
+        let root = fs::read_to_string(&settings_path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<ManagerSettings>(&content).ok())
+            .map(|settings| settings.data_directory)
+            .unwrap_or(default_root);
         fs::create_dir_all(root.join("versions")).map_err(|error| error.to_string())?;
         fs::create_dir_all(root.join("logs")).map_err(|error| error.to_string())?;
         let config_path = root.join("config.yml");
@@ -161,7 +181,9 @@ impl AppState {
             message: "AxonHub Manager 本地控制平面已初始化".into(),
         });
         Ok(Self {
-            root,
+            app_handle: app.clone(),
+            root: Mutex::new(root),
+            settings_path,
             client: reqwest::Client::builder()
                 .user_agent("AxonHub-Manager/0.1")
                 .timeout(std::time::Duration::from_secs(30))
@@ -188,10 +210,13 @@ impl AppState {
     }
 
     fn config_path(&self) -> PathBuf {
-        self.root.join("config.yml")
+        self.root().join("config.yml")
     }
     fn process_log_path(&self) -> PathBuf {
-        self.root.join("logs").join("axonhub.log")
+        self.root().join("logs").join("axonhub.log")
+    }
+    fn root(&self) -> PathBuf {
+        self.root.lock().expect("root mutex poisoned").clone()
     }
 
     fn log(&self, level: &str, message: impl Into<String>) {
@@ -233,6 +258,19 @@ impl AppState {
     }
 }
 
+#[tauri::command]
+async fn set_autostart(enabled: bool, state: State<'_, AppState>) -> Result<Snapshot> {
+    let manager = state.app_handle.autolaunch();
+    if enabled {
+        manager.enable().map_err(|error| error.to_string())?;
+        state.log("info", "已开启开机自启");
+    } else {
+        manager.disable().map_err(|error| error.to_string())?;
+        state.log("info", "已关闭开机自启");
+    }
+    Ok(snapshot(&state).await)
+}
+
 impl Drop for AppState {
     fn drop(&mut self) {
         if let Ok(runtime) = self.runtime.get_mut() {
@@ -253,6 +291,104 @@ fn read_manifest(path: &Path) -> Option<Manifest> {
 fn write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
     let content = serde_json::to_string_pretty(manifest).map_err(|error| error.to_string())?;
     fs::write(path, content).map_err(|error| error.to_string())
+}
+
+fn copy_directory(source: &Path, target: &Path) -> Result<()> {
+    fs::create_dir_all(target).map_err(|error| error.to_string())?;
+    for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_directory(&source_path, &target_path)?;
+        } else {
+            fs::copy(&source_path, &target_path).map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn migrated_manifest(manifest: &Manifest, source: &Path, target: &Path) -> Manifest {
+    let executable_path = manifest
+        .executable_path
+        .strip_prefix(source)
+        .map(|relative| target.join(relative))
+        .unwrap_or_else(|_| manifest.executable_path.clone());
+    Manifest {
+        executable_path,
+        ..manifest.clone()
+    }
+}
+
+#[tauri::command]
+async fn change_data_directory(directory: String, state: State<'_, AppState>) -> Result<Snapshot> {
+    let source = state.root();
+    let target = PathBuf::from(directory);
+    if target == source {
+        return Ok(snapshot(&state).await);
+    }
+    if target.starts_with(&source) || source.starts_with(&target) {
+        return Err("新旧数据目录不能互相包含".into());
+    }
+    if target.exists()
+        && fs::read_dir(&target)
+            .map_err(|error| error.to_string())?
+            .next()
+            .is_some()
+    {
+        return Err("目标目录必须为空".into());
+    }
+    let was_running = state
+        .runtime
+        .lock()
+        .expect("runtime mutex poisoned")
+        .child
+        .is_some();
+    stop_managed_process(&state)?;
+    if let Err(error) = copy_directory(&source, &target) {
+        if was_running {
+            let _ = start_if_installed(&state).await;
+        }
+        return Err(format!("迁移数据目录失败：{error}"));
+    }
+    let (installed, previous) = {
+        let runtime = state.runtime.lock().expect("runtime mutex poisoned");
+        (
+            runtime
+                .installed
+                .as_ref()
+                .map(|item| migrated_manifest(item, &source, &target)),
+            runtime
+                .previous
+                .as_ref()
+                .map(|item| migrated_manifest(item, &source, &target)),
+        )
+    };
+    if let Some(item) = installed.as_ref() {
+        write_manifest(&target.join("current.json"), item)?;
+    }
+    if let Some(item) = previous.as_ref() {
+        write_manifest(&target.join("previous.json"), item)?;
+    }
+    let settings = ManagerSettings {
+        data_directory: target.clone(),
+    };
+    let content = serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?;
+    fs::write(&state.settings_path, content).map_err(|error| error.to_string())?;
+    {
+        let mut runtime = state.runtime.lock().expect("runtime mutex poisoned");
+        runtime.installed = installed;
+        runtime.previous = previous;
+    }
+    *state.root.lock().expect("root mutex poisoned") = target;
+    state.log(
+        "info",
+        format!("数据目录已迁移，原目录保留：{}", source.display()),
+    );
+    if was_running {
+        start_if_installed(&state).await?;
+    }
+    Ok(snapshot(&state).await)
 }
 
 fn port_from_config(path: &Path) -> u16 {
@@ -384,10 +520,11 @@ async fn snapshot(state: &AppState) -> Snapshot {
     let installed_version = runtime.installed.as_ref().map(|item| item.version.clone());
     let latest_version = runtime.latest_version.clone();
     let update_available = matches!((&installed_version, &latest_version), (Some(current), Some(latest)) if current != latest);
+    let autostart_enabled = state.app_handle.autolaunch().is_enabled().unwrap_or(false);
     Snapshot {
         platform: std::env::consts::OS.to_owned(),
         architecture: std::env::consts::ARCH.to_owned(),
-        data_directory: state.root.display().to_string(),
+        data_directory: state.root().display().to_string(),
         config_path: state.config_path().display().to_string(),
         installed_version,
         previous_version: runtime.previous.as_ref().map(|item| item.version.clone()),
@@ -404,6 +541,7 @@ async fn snapshot(state: &AppState) -> Snapshot {
         progress_label: runtime.progress_label.clone(),
         last_error: runtime.last_error.clone(),
         logs,
+        autostart_enabled,
     }
 }
 
@@ -490,7 +628,7 @@ async fn install_latest(state: State<'_, AppState>) -> Result<Snapshot> {
             }
         }
         let version_dir = state
-            .root
+            .root()
             .join("versions")
             .join(release.tag_name.trim_start_matches('v'));
         fs::create_dir_all(&version_dir).map_err(|error| error.to_string())?;
@@ -518,10 +656,10 @@ async fn install_latest(state: State<'_, AppState>) -> Result<Snapshot> {
         stop_managed_process(&state)?;
         let mut runtime = state.runtime.lock().expect("runtime mutex poisoned");
         if let Some(current) = runtime.installed.take() {
-            write_manifest(&state.root.join("previous.json"), &current)?;
+            write_manifest(&state.root().join("previous.json"), &current)?;
             runtime.previous = Some(current);
         }
-        write_manifest(&state.root.join("current.json"), &manifest)?;
+        write_manifest(&state.root().join("current.json"), &manifest)?;
         runtime.installed = Some(manifest);
         runtime.latest_version = Some(release.tag_name.clone());
         runtime.lifecycle = Lifecycle::Stopped;
@@ -572,10 +710,17 @@ async fn start_managed_process(state: &AppState) -> Result<()> {
         .open(state.process_log_path())
         .map_err(|error| error.to_string())?;
     let err_log = log.try_clone().map_err(|error| error.to_string())?;
-    let child = Command::new(&executable)
-        .current_dir(&state.root)
+    let mut command = Command::new(&executable);
+    command
+        .current_dir(state.root())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(err_log))
+        .stderr(Stdio::from(err_log));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
+    let child = command
         .spawn()
         .map_err(|error| state.fail(format!("启动 AxonHub 失败：{error}")))?;
     let pid = child.id();
@@ -654,9 +799,9 @@ async fn rollback_version(state: State<'_, AppState>) -> Result<Snapshot> {
         if let Some(current) = runtime.installed.replace(previous.clone()) {
             runtime.previous = Some(current);
         }
-        write_manifest(&state.root.join("current.json"), &previous)?;
+        write_manifest(&state.root().join("current.json"), &previous)?;
         if let Some(item) = &runtime.previous {
-            write_manifest(&state.root.join("previous.json"), item)?;
+            write_manifest(&state.root().join("previous.json"), item)?;
         }
         runtime.lifecycle = Lifecycle::Stopped;
         runtime.logs.push_back(LogEntry {
@@ -734,7 +879,7 @@ fn validate_with_binary(state: &AppState) -> Result<()> {
     };
     let output = Command::new(executable)
         .args(["config", "validate"])
-        .current_dir(&state.root)
+        .current_dir(state.root())
         .output()
         .map_err(|error| format!("无法运行配置校验：{error}"))?;
     if output.status.success() {
@@ -765,13 +910,13 @@ async fn open_management(state: State<'_, AppState>) -> Result<Snapshot> {
 
 #[tauri::command]
 async fn open_data_directory(state: State<'_, AppState>) -> Result<Snapshot> {
-    open::that(&state.root).map_err(|error| error.to_string())?;
+    open::that(state.root()).map_err(|error| error.to_string())?;
     Ok(snapshot(&state).await)
 }
 
 #[tauri::command]
 async fn open_log_directory(state: State<'_, AppState>) -> Result<Snapshot> {
-    open::that(state.root.join("logs")).map_err(|error| error.to_string())?;
+    open::that(state.root().join("logs")).map_err(|error| error.to_string())?;
     Ok(snapshot(&state).await)
 }
 
@@ -804,6 +949,8 @@ fn request_shutdown(app: AppHandle) {
 
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_autostart::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -811,6 +958,9 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.hide();
+            }
             let state = AppState::new(app.handle()).map_err(std::io::Error::other)?;
             app.manage(state);
 
@@ -866,7 +1016,9 @@ pub fn run() {
             validate_config,
             open_management,
             open_data_directory,
-            open_log_directory
+            open_log_directory,
+            set_autostart,
+            change_data_directory
         ])
         .build(tauri::generate_context!())
         .expect("error while building AxonHub Manager");

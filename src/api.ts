@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import type { Snapshot } from "./types";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
@@ -11,6 +12,7 @@ const demo: Snapshot = {
   management_url: "http://127.0.0.1:8090", uptime: null, busy: false,
   progress_percent: null, progress_label: null, last_error: null,
   logs: [{ timestamp: new Date().toISOString(), level: "info", message: "前端预览模式：启动 Tauri 后可管理真实 AxonHub 实例" }],
+  autostart_enabled: false,
 };
 
 export async function getSnapshot(): Promise<Snapshot> {
@@ -29,4 +31,20 @@ export async function readConfig(): Promise<string> {
 
 export async function saveConfig(content: string): Promise<Snapshot> {
   return invoke("save_config", { content });
+}
+
+export async function setAutostart(enabled: boolean): Promise<Snapshot> {
+  if (!isTauri()) return { ...demo, autostart_enabled: enabled };
+  return invoke("set_autostart", { enabled });
+}
+
+export async function selectDataDirectory(): Promise<string | null> {
+  if (!isTauri()) return "D:\\AxonHub-Data";
+  const selected = await open({ directory: true, multiple: false, title: "选择 AxonHub 数据目录" });
+  return typeof selected === "string" ? selected : null;
+}
+
+export async function changeDataDirectory(directory: string): Promise<Snapshot> {
+  if (!isTauri()) return { ...demo, data_directory: directory };
+  return invoke("change_data_directory", { directory });
 }

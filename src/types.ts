@@ -26,4 +26,5 @@ export interface Snapshot {
   progress_label: string | null;
   last_error: string | null;
   logs: LogEntry[];
+  autostart_enabled: boolean;
 }

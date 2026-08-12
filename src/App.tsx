@@ -5,7 +5,7 @@ import {
   LayoutDashboard, LoaderCircle, Moon, RefreshCw, RotateCcw, Save, Server,
   Settings, ShieldCheck, SquareTerminal, Sun, Workflow,
 } from "lucide-react";
-import { getSnapshot, readConfig, run, saveConfig } from "./api";
+import { changeDataDirectory, getSnapshot, readConfig, run, saveConfig, selectDataDirectory, setAutostart } from "./api";
 import type { Lifecycle, Snapshot } from "./types";
 
 type View = "overview" | "config" | "logs" | "settings";
@@ -26,6 +26,7 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [config, setConfig] = useState("");
   const [savedConfig, setSavedConfig] = useState("");
+  const [selectedDataDirectory, setSelectedDataDirectory] = useState<string | null>(null);
   const [theme, setTheme] = useState<"dark" | "light">(() => (localStorage.getItem("axonhub-theme") as "dark" | "light") || "dark");
 
   const refresh = useCallback(async () => {
@@ -47,6 +48,29 @@ export default function App() {
     try { const next = await saveConfig(config); setSnapshot(next); setSavedConfig(config); }
     catch (cause) { setError(String(cause)); } finally { setPending(null); }
   }, [config]);
+
+  const toggleAutostart = useCallback(async () => {
+    if (!snapshot) return;
+    setPending("set_autostart"); setError(null);
+    try { setSnapshot(await setAutostart(!snapshot.autostart_enabled)); }
+    catch (cause) { setError(String(cause)); }
+    finally { setPending(null); }
+  }, [snapshot]);
+
+  const chooseDataDirectory = useCallback(async (): Promise<void> => {
+    setPending("select_data_directory"); setError(null);
+    try { setSelectedDataDirectory(await selectDataDirectory()); }
+    catch (cause) { setError(String(cause)); }
+    finally { setPending(null); }
+  }, []);
+
+  const migrateDataDirectory = useCallback(async (): Promise<void> => {
+    if (selectedDataDirectory === null) return;
+    setPending("change_data_directory"); setError(null);
+    try { setSnapshot(await changeDataDirectory(selectedDataDirectory)); setSelectedDataDirectory(null); }
+    catch (cause) { setError(String(cause)); await refresh(); }
+    finally { setPending(null); }
+  }, [refresh, selectedDataDirectory]);
 
   const filteredLogs = useMemo(() => snapshot?.logs.slice(-250).reverse() ?? [], [snapshot]);
   if (!snapshot) return <div className="boot"><LoaderCircle className="spin" />正在连接本地控制平面…</div>;
@@ -115,7 +139,10 @@ export default function App() {
       {view === "logs" && <section className="logs-panel"><div className="terminal-head"><div><i /><i /><i /></div><span>axonhub.log</span><button onClick={() => action("open_log_directory")}><FolderOpen />打开目录</button></div><div className="terminal-body">{filteredLogs.length ? filteredLogs.map((entry, index) => <div className={`log-row ${entry.level}`} key={`${entry.timestamp}-${index}`}><time>{new Date(entry.timestamp).toLocaleTimeString("zh-CN", { hour12: false })}</time><span>{entry.level.toUpperCase()}</span><p>{entry.message}</p></div>) : <div className="empty">暂无日志。启动 AxonHub 后，进程输出会显示在这里。</div>}</div></section>}
 
       {view === "settings" && <section className="settings-grid">
-        <article><div className="setting-title"><HardDrive /><div><strong>数据目录</strong><span>托管版本、SQLite 数据库、配置与日志</span></div></div><code>{snapshot.data_directory}</code><button className="secondary" onClick={() => action("open_data_directory")}><FolderOpen />打开目录</button></article>
+        <article className="autostart-setting"><div className="setting-title"><Settings /><div><strong>开机自启</strong><span>登录系统后自动启动 Manager 并驻留托盘</span></div></div><button className={`toggle ${snapshot.autostart_enabled ? "on" : ""}`} role="switch" aria-label={`开机自启，当前${snapshot.autostart_enabled ? "已开启" : "已关闭"}`} aria-checked={snapshot.autostart_enabled} disabled={pending === "set_autostart"} onClick={toggleAutostart}><i /></button></article>
+        <article className="directory-setting"><div className="setting-title"><HardDrive /><div><strong>数据目录</strong><span>托管版本、SQLite 数据库、配置与日志</span></div></div><code>{snapshot.data_directory}</code><div className="directory-buttons"><button className="secondary" disabled={pending !== null} onClick={chooseDataDirectory}>{pending === "select_data_directory" ? <LoaderCircle className="spin" /> : <FolderOpen />}选择目录</button><button className="secondary" onClick={() => action("open_data_directory")}><FolderOpen />打开目录</button></div></article>
+        {selectedDataDirectory !== null && selectedDataDirectory !== snapshot.data_directory && <article className="migration-setting"><div className="setting-title"><HardDrive /><div><strong>待切换目录</strong><span>迁移完成后原目录保留</span></div></div><code>{selectedDataDirectory}</code><button className="primary" disabled={pending !== null} onClick={migrateDataDirectory}>{pending === "change_data_directory" ? <LoaderCircle className="spin" /> : <CheckCircle2 />}迁移并切换</button></article>}
+        {selectedDataDirectory === snapshot.data_directory && <article className="migration-setting"><div className="setting-title"><HardDrive /><div><strong>待切换目录</strong><span>已是当前目录</span></div></div><code>{selectedDataDirectory}</code></article>}
         <article><div className="setting-title"><Server /><div><strong>运行端点</strong><span>桌面管理器连接的本地 AxonHub 地址</span></div></div><code>{snapshot.management_url}</code><button className="secondary" disabled={!snapshot.healthy} onClick={() => action("open_management")}><ExternalLink />打开页面</button></article>
         <article><div className="setting-title"><Github /><div><strong>上游项目</strong><span>Release 资产来自 looplj/axonhub</span></div></div><code>github.com/looplj/axonhub</code><a className="secondary link-btn" href="https://github.com/looplj/axonhub" target="_blank" rel="noreferrer"><Github />查看源码</a></article>
       </section>}

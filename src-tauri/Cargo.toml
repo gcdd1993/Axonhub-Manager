@@ -1,6 +1,6 @@
 [package]
 name = "axonhub-manager"
-version = "0.0.1"
+version = "0.0.2"
 description = "Native desktop lifecycle manager for AxonHub"
 authors = ["AxonHub Manager contributors"]
 edition = "2021"
@@ -21,6 +21,8 @@ serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
 tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-autostart = "2"
+tauri-plugin-dialog = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["process", "time"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
