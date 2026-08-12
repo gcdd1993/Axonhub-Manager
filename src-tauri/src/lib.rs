@@ -172,8 +172,8 @@ impl AppState {
         if !config_path.exists() {
             fs::write(&config_path, DEFAULT_CONFIG).map_err(|error| error.to_string())?;
         }
-        let installed = read_manifest(&root.join("current.json"));
-        let previous = read_manifest(&root.join("previous.json"));
+        let installed = load_manifest(&root, "current.json");
+        let previous = load_manifest(&root, "previous.json");
         let mut logs = VecDeque::new();
         logs.push_back(LogEntry {
             timestamp: Utc::now().to_rfc3339(),
@@ -288,12 +288,31 @@ fn read_manifest(path: &Path) -> Option<Manifest> {
         .and_then(|content| serde_json::from_str(&content).ok())
 }
 
+fn load_manifest(root: &Path, name: &str) -> Option<Manifest> {
+    let path = root.join(name);
+    let mut manifest = read_manifest(&path)?;
+    if manifest.executable_path.is_file() {
+        return Some(manifest);
+    }
+    let version_directory = root
+        .join("versions")
+        .join(manifest.version.trim_start_matches('v'));
+    if let Some(executable_path) = find_executable(&version_directory) {
+        manifest.executable_path = executable_path;
+        let _ = write_manifest(&path, &manifest);
+    }
+    Some(manifest)
+}
+
 fn write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
     let content = serde_json::to_string_pretty(manifest).map_err(|error| error.to_string())?;
     fs::write(path, content).map_err(|error| error.to_string())
 }
 
 fn copy_directory(source: &Path, target: &Path) -> Result<()> {
+    if target.is_file() {
+        fs::remove_file(target).map_err(|error| error.to_string())?;
+    }
     fs::create_dir_all(target).map_err(|error| error.to_string())?;
     for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
@@ -302,10 +321,116 @@ fn copy_directory(source: &Path, target: &Path) -> Result<()> {
         if source_path.is_dir() {
             copy_directory(&source_path, &target_path)?;
         } else {
+            if target_path.is_dir() {
+                fs::remove_dir_all(&target_path).map_err(|error| error.to_string())?;
+            }
             fs::copy(&source_path, &target_path).map_err(|error| error.to_string())?;
         }
     }
     Ok(())
+}
+
+fn directory_is_non_empty(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    if !path.is_dir() {
+        return Err("目标路径不是目录".into());
+    }
+    Ok(fs::read_dir(path)
+        .map_err(|error| error.to_string())?
+        .next()
+        .is_some())
+}
+
+fn prepare_data_directory(path: &Path) -> Result<()> {
+    fs::create_dir_all(path.join("versions")).map_err(|error| error.to_string())?;
+    fs::create_dir_all(path.join("logs")).map_err(|error| error.to_string())?;
+    let config_path = path.join("config.yml");
+    if !config_path.exists() {
+        fs::write(config_path, DEFAULT_CONFIG).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod data_directory_tests {
+    use super::{copy_directory, directory_is_non_empty, load_manifest, write_manifest, Manifest};
+    use std::{fs, path::PathBuf};
+
+    fn test_directory(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "axonhub-manager-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before Unix epoch")
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn copy_directory_overwrites_conflicts_and_preserves_other_files() {
+        let root = test_directory("overwrite");
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir_all(target.join("nested")).unwrap();
+        fs::write(source.join("nested/data.txt"), "new").unwrap();
+        fs::write(target.join("nested/data.txt"), "old").unwrap();
+        fs::write(target.join("keep.txt"), "keep").unwrap();
+
+        copy_directory(&source, &target).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(target.join("nested/data.txt")).unwrap(),
+            "new"
+        );
+        assert_eq!(fs::read_to_string(target.join("keep.txt")).unwrap(), "keep");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn directory_non_empty_check_handles_missing_and_populated_directories() {
+        let root = test_directory("non-empty");
+        assert!(!directory_is_non_empty(&root).unwrap());
+        fs::create_dir_all(&root).unwrap();
+        assert!(!directory_is_non_empty(&root).unwrap());
+        fs::write(root.join("data.txt"), "data").unwrap();
+        assert!(directory_is_non_empty(&root).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_manifest_repairs_an_executable_path_after_the_data_directory_moves() {
+        let root = test_directory("repair-manifest");
+        let executable = root.join("versions/1.0.0/axonhub.exe");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, "binary").unwrap();
+        let manifest_path = root.join("current.json");
+        write_manifest(
+            &manifest_path,
+            &Manifest {
+                version: "v1.0.0".into(),
+                asset_name: "axonhub.zip".into(),
+                executable_path: PathBuf::from("Z:/old-data/versions/1.0.0/axonhub.exe"),
+                sha256: "hash".into(),
+                installed_at: "now".into(),
+            },
+        )
+        .unwrap();
+
+        let manifest = load_manifest(&root, "current.json").unwrap();
+
+        assert_eq!(manifest.executable_path, executable);
+        assert_eq!(
+            load_manifest(&root, "current.json")
+                .unwrap()
+                .executable_path,
+            executable
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn migrated_manifest(manifest: &Manifest, source: &Path, target: &Path) -> Manifest {
@@ -321,7 +446,16 @@ fn migrated_manifest(manifest: &Manifest, source: &Path, target: &Path) -> Manif
 }
 
 #[tauri::command]
-async fn change_data_directory(directory: String, state: State<'_, AppState>) -> Result<Snapshot> {
+fn is_data_directory_non_empty(directory: String) -> Result<bool> {
+    directory_is_non_empty(Path::new(&directory))
+}
+
+#[tauri::command]
+async fn change_data_directory(
+    directory: String,
+    migrate: bool,
+    state: State<'_, AppState>,
+) -> Result<Snapshot> {
     let source = state.root();
     let target = PathBuf::from(directory);
     if target == source {
@@ -330,14 +464,6 @@ async fn change_data_directory(directory: String, state: State<'_, AppState>) ->
     if target.starts_with(&source) || source.starts_with(&target) {
         return Err("新旧数据目录不能互相包含".into());
     }
-    if target.exists()
-        && fs::read_dir(&target)
-            .map_err(|error| error.to_string())?
-            .next()
-            .is_some()
-    {
-        return Err("目标目录必须为空".into());
-    }
     let was_running = state
         .runtime
         .lock()
@@ -345,13 +471,18 @@ async fn change_data_directory(directory: String, state: State<'_, AppState>) ->
         .child
         .is_some();
     stop_managed_process(&state)?;
-    if let Err(error) = copy_directory(&source, &target) {
+    let prepare_result = if migrate {
+        copy_directory(&source, &target)
+    } else {
+        prepare_data_directory(&target)
+    };
+    if let Err(error) = prepare_result {
         if was_running {
             let _ = start_if_installed(&state).await;
         }
-        return Err(format!("迁移数据目录失败：{error}"));
+        return Err(format!("切换数据目录失败：{error}"));
     }
-    let (installed, previous) = {
+    let (installed, previous) = if migrate {
         let runtime = state.runtime.lock().expect("runtime mutex poisoned");
         (
             runtime
@@ -363,12 +494,21 @@ async fn change_data_directory(directory: String, state: State<'_, AppState>) ->
                 .as_ref()
                 .map(|item| migrated_manifest(item, &source, &target)),
         )
+    } else {
+        (
+            load_manifest(&target, "current.json"),
+            load_manifest(&target, "previous.json"),
+        )
     };
     if let Some(item) = installed.as_ref() {
         write_manifest(&target.join("current.json"), item)?;
+    } else if migrate {
+        let _ = fs::remove_file(target.join("current.json"));
     }
     if let Some(item) = previous.as_ref() {
         write_manifest(&target.join("previous.json"), item)?;
+    } else if migrate {
+        let _ = fs::remove_file(target.join("previous.json"));
     }
     let settings = ManagerSettings {
         data_directory: target.clone(),
@@ -379,12 +519,25 @@ async fn change_data_directory(directory: String, state: State<'_, AppState>) ->
         let mut runtime = state.runtime.lock().expect("runtime mutex poisoned");
         runtime.installed = installed;
         runtime.previous = previous;
+        runtime.lifecycle = if runtime.installed.is_some() {
+            Lifecycle::Stopped
+        } else {
+            Lifecycle::NotInstalled
+        };
+        runtime.last_error = None;
     }
     *state.root.lock().expect("root mutex poisoned") = target;
-    state.log(
-        "info",
-        format!("数据目录已迁移，原目录保留：{}", source.display()),
-    );
+    if migrate {
+        state.log(
+            "info",
+            format!("数据目录已迁移，原目录保留：{}", source.display()),
+        );
+    } else {
+        state.log(
+            "info",
+            format!("数据目录已切换，未迁移原目录：{}", source.display()),
+        );
+    }
     if was_running {
         start_if_installed(&state).await?;
     }
@@ -704,6 +857,12 @@ async fn start_managed_process(state: &AppState) -> Result<()> {
             .map(|item| item.executable_path.clone())
             .ok_or("请先安装 AxonHub")?
     };
+    if !executable.is_file() {
+        return Err(state.fail(format!(
+            "启动 AxonHub 失败：可执行文件不存在：{}。请重新安装 AxonHub 或检查数据目录。",
+            executable.display()
+        )));
+    }
     let log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -782,6 +941,12 @@ fn stop_managed_process(state: &AppState) -> Result<()> {
         state.log("info", "AxonHub 已停止");
     }
     Ok(())
+}
+
+#[tauri::command]
+async fn start_axonhub(state: State<'_, AppState>) -> Result<Snapshot> {
+    start_managed_process(&state).await?;
+    Ok(snapshot(&state).await)
 }
 
 #[tauri::command]
@@ -1010,6 +1175,7 @@ pub fn run() {
             get_snapshot,
             check_updates,
             install_latest,
+            start_axonhub,
             rollback_version,
             read_config,
             save_config,
@@ -1018,6 +1184,7 @@ pub fn run() {
             open_data_directory,
             open_log_directory,
             set_autostart,
+            is_data_directory_non_empty,
             change_data_directory
         ])
         .build(tauri::generate_context!())

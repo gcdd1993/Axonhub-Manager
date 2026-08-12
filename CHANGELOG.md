@@ -7,6 +7,18 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.0.3] - 2026-08-12
+
+### Added
+
+- Added a manual AxonHub start action to the overview page.
+- Added explicit migrate-and-overwrite or switch-without-migration choices for non-empty data directories.
+
+### Fixed
+
+- Repair stale executable paths automatically when an existing AxonHub data directory moves or its drive letter changes.
+- Reload installed-version state correctly when switching to an existing data directory without migration.
+
 ## [0.0.2] - 2026-08-12
 
 ### Added
@@ -32,6 +44,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Added English and Simplified Chinese documentation.
 - Added GitHub Actions verification and tagged release publishing.
 
-[Unreleased]: https://github.com/gcdd1993/Axonhub-Manager/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/gcdd1993/Axonhub-Manager/compare/v0.0.3...HEAD
+[0.0.3]: https://github.com/gcdd1993/Axonhub-Manager/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/gcdd1993/Axonhub-Manager/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/gcdd1993/Axonhub-Manager/releases/tag/v0.0.1

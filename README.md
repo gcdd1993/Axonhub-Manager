@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-![Version](https://img.shields.io/badge/version-0.0.1-blue)
+![Version](https://img.shields.io/badge/version-0.0.3-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows-0078D4)
 ![Tauri](https://img.shields.io/badge/Tauri-2-24C8DB)
 ![Rust](https://img.shields.io/badge/Rust-2021-000000)

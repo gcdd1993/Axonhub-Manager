@@ -2,10 +2,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Activity, ArrowUpRight, CheckCircle2, ChevronRight, CircleAlert,
   Code2, Download, ExternalLink, FileCode2, FolderOpen, Gauge, Github, HardDrive,
-  LayoutDashboard, LoaderCircle, Moon, RefreshCw, RotateCcw, Save, Server,
-  Settings, ShieldCheck, SquareTerminal, Sun, Workflow,
+  LayoutDashboard, LoaderCircle, Moon, Play, RefreshCw, RotateCcw, Save, Server,
+  Settings, ShieldCheck, SquareTerminal, Sun, TriangleAlert, Workflow, X,
 } from "lucide-react";
-import { changeDataDirectory, getSnapshot, readConfig, run, saveConfig, selectDataDirectory, setAutostart } from "./api";
+import { changeDataDirectory, getSnapshot, isDataDirectoryNonEmpty, readConfig, run, saveConfig, selectDataDirectory, setAutostart } from "./api";
 import type { Lifecycle, Snapshot } from "./types";
 
 type View = "overview" | "config" | "logs" | "settings";
@@ -27,6 +27,7 @@ export default function App() {
   const [config, setConfig] = useState("");
   const [savedConfig, setSavedConfig] = useState("");
   const [selectedDataDirectory, setSelectedDataDirectory] = useState<string | null>(null);
+  const [showMigrationChoice, setShowMigrationChoice] = useState(false);
   const [theme, setTheme] = useState<"dark" | "light">(() => (localStorage.getItem("axonhub-theme") as "dark" | "light") || "dark");
 
   const refresh = useCallback(async () => {
@@ -59,18 +60,40 @@ export default function App() {
 
   const chooseDataDirectory = useCallback(async (): Promise<void> => {
     setPending("select_data_directory"); setError(null);
-    try { setSelectedDataDirectory(await selectDataDirectory()); }
+    try {
+      const directory = await selectDataDirectory();
+      setSelectedDataDirectory(directory);
+      setShowMigrationChoice(directory !== null && directory !== snapshot?.data_directory && await isDataDirectoryNonEmpty(directory));
+    }
     catch (cause) { setError(String(cause)); }
     finally { setPending(null); }
-  }, []);
+  }, [snapshot?.data_directory]);
 
-  const migrateDataDirectory = useCallback(async (): Promise<void> => {
+  const applyDataDirectory = useCallback(async (migrate: boolean): Promise<void> => {
     if (selectedDataDirectory === null) return;
     setPending("change_data_directory"); setError(null);
-    try { setSnapshot(await changeDataDirectory(selectedDataDirectory)); setSelectedDataDirectory(null); }
+    try {
+      setSnapshot(await changeDataDirectory(selectedDataDirectory, migrate));
+      setSelectedDataDirectory(null);
+      setShowMigrationChoice(false);
+    }
     catch (cause) { setError(String(cause)); await refresh(); }
     finally { setPending(null); }
   }, [refresh, selectedDataDirectory]);
+
+  const cancelMigrationChoice = useCallback(() => {
+    setShowMigrationChoice(false);
+    setSelectedDataDirectory(null);
+  }, []);
+
+  useEffect(() => {
+    if (!showMigrationChoice) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && pending === null) cancelMigrationChoice();
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [cancelMigrationChoice, pending, showMigrationChoice]);
 
   const filteredLogs = useMemo(() => snapshot?.logs.slice(-250).reverse() ?? [], [snapshot]);
   if (!snapshot) return <div className="boot"><LoaderCircle className="spin" />正在连接本地控制平面…</div>;
@@ -104,7 +127,7 @@ export default function App() {
         <section className="hero-card">
           <div className="hero-copy"><div className="hero-icon"><Server /></div><div><div className="eyebrow">AXONHUB INSTANCE</div><h2>{snapshot.healthy ? "网关运行稳定" : installed ? "实例正在由 Manager 托管" : "部署你的本地 AI 网关"}</h2><p>统一管理 OpenAI、Anthropic、Gemini 等协议的本地接入入口。</p></div></div>
           <Status snapshot={snapshot} />
-          <div className="hero-actions"><button className="secondary" disabled={!snapshot.healthy} onClick={() => action("open_management")}><ExternalLink />打开管理后台</button><button className="icon-btn" disabled={!snapshot.previous_version || snapshot.busy} title="回滚上一版本" aria-label="回滚上一版本" onClick={() => action("rollback_version")}><RotateCcw /></button></div>
+          <div className="hero-actions">{installed && snapshot.pid === null && <button className="primary" disabled={snapshot.busy || Boolean(pending)} onClick={() => action("start_axonhub")}>{pending === "start_axonhub" ? <LoaderCircle className="spin" /> : <Play />}启动 AxonHub</button>}<button className="secondary" disabled={!snapshot.healthy} onClick={() => action("open_management")}><ExternalLink />打开管理后台</button><button className="icon-btn" disabled={!snapshot.previous_version || snapshot.busy} title="回滚上一版本" aria-label="回滚上一版本" onClick={() => action("rollback_version")}><RotateCcw /></button></div>
         </section>
 
         {snapshot.busy && <div className="progress-card"><div><span>{snapshot.progress_label ?? "处理中"}</span><strong>{snapshot.progress_percent ?? 0}%</strong></div><div className="progress-track"><i style={{ width: `${snapshot.progress_percent ?? 3}%` }} /></div></div>}
@@ -141,11 +164,25 @@ export default function App() {
       {view === "settings" && <section className="settings-grid">
         <article className="autostart-setting"><div className="setting-title"><Settings /><div><strong>开机自启</strong><span>登录系统后自动启动 Manager 并驻留托盘</span></div></div><button className={`toggle ${snapshot.autostart_enabled ? "on" : ""}`} role="switch" aria-label={`开机自启，当前${snapshot.autostart_enabled ? "已开启" : "已关闭"}`} aria-checked={snapshot.autostart_enabled} disabled={pending === "set_autostart"} onClick={toggleAutostart}><i /></button></article>
         <article className="directory-setting"><div className="setting-title"><HardDrive /><div><strong>数据目录</strong><span>托管版本、SQLite 数据库、配置与日志</span></div></div><code>{snapshot.data_directory}</code><div className="directory-buttons"><button className="secondary" disabled={pending !== null} onClick={chooseDataDirectory}>{pending === "select_data_directory" ? <LoaderCircle className="spin" /> : <FolderOpen />}选择目录</button><button className="secondary" onClick={() => action("open_data_directory")}><FolderOpen />打开目录</button></div></article>
-        {selectedDataDirectory !== null && selectedDataDirectory !== snapshot.data_directory && <article className="migration-setting"><div className="setting-title"><HardDrive /><div><strong>待切换目录</strong><span>迁移完成后原目录保留</span></div></div><code>{selectedDataDirectory}</code><button className="primary" disabled={pending !== null} onClick={migrateDataDirectory}>{pending === "change_data_directory" ? <LoaderCircle className="spin" /> : <CheckCircle2 />}迁移并切换</button></article>}
+        {selectedDataDirectory !== null && selectedDataDirectory !== snapshot.data_directory && <article className="migration-setting"><div className="setting-title"><HardDrive /><div><strong>待切换目录</strong><span>迁移完成后原目录保留</span></div></div><code>{selectedDataDirectory}</code><button className="primary" disabled={pending !== null} onClick={() => void applyDataDirectory(true)}>{pending === "change_data_directory" ? <LoaderCircle className="spin" /> : <CheckCircle2 />}迁移并切换</button></article>}
         {selectedDataDirectory === snapshot.data_directory && <article className="migration-setting"><div className="setting-title"><HardDrive /><div><strong>待切换目录</strong><span>已是当前目录</span></div></div><code>{selectedDataDirectory}</code></article>}
         <article><div className="setting-title"><Server /><div><strong>运行端点</strong><span>桌面管理器连接的本地 AxonHub 地址</span></div></div><code>{snapshot.management_url}</code><button className="secondary" disabled={!snapshot.healthy} onClick={() => action("open_management")}><ExternalLink />打开页面</button></article>
         <article><div className="setting-title"><Github /><div><strong>上游项目</strong><span>Release 资产来自 looplj/axonhub</span></div></div><code>github.com/looplj/axonhub</code><a className="secondary link-btn" href="https://github.com/looplj/axonhub" target="_blank" rel="noreferrer"><Github />查看源码</a></article>
       </section>}
+
+      {showMigrationChoice && selectedDataDirectory !== null && <div className="modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && pending === null) cancelMigrationChoice(); }}>
+        <section className="migration-dialog" role="dialog" aria-modal="true" aria-labelledby="migration-dialog-title" aria-describedby="migration-dialog-description">
+          <button className="dialog-close" aria-label="关闭" disabled={pending !== null} onClick={cancelMigrationChoice}><X /></button>
+          <div className="dialog-icon"><TriangleAlert /></div>
+          <div><span className="kicker">DIRECTORY NOT EMPTY</span><h2 id="migration-dialog-title">目标目录不是空目录</h2></div>
+          <p id="migration-dialog-description">请选择如何切换数据目录。迁移会覆盖目标目录中的同名内容，无冲突文件和原数据目录都会保留。</p>
+          <code>{selectedDataDirectory}</code>
+          <div className="dialog-actions">
+            <button className="secondary" autoFocus disabled={pending !== null} onClick={() => void applyDataDirectory(false)}>不迁移</button>
+            <button className="danger" disabled={pending !== null} onClick={() => void applyDataDirectory(true)}>{pending === "change_data_directory" ? <LoaderCircle className="spin" /> : <TriangleAlert />}迁移并覆盖</button>
+          </div>
+        </section>
+      </div>}
 
       <footer><span>AxonHub Manager · Tauri + Rust</span><span>{snapshot.platform} / {snapshot.architecture}</span></footer>
     </main>

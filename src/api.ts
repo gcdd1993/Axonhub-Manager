@@ -44,7 +44,12 @@ export async function selectDataDirectory(): Promise<string | null> {
   return typeof selected === "string" ? selected : null;
 }
 
-export async function changeDataDirectory(directory: string): Promise<Snapshot> {
+export async function isDataDirectoryNonEmpty(directory: string): Promise<boolean> {
+  if (!isTauri()) return directory === "D:\\AxonHub-Data";
+  return invoke("is_data_directory_non_empty", { directory });
+}
+
+export async function changeDataDirectory(directory: string, migrate: boolean): Promise<Snapshot> {
   if (!isTauri()) return { ...demo, data_directory: directory };
-  return invoke("change_data_directory", { directory });
+  return invoke("change_data_directory", { directory, migrate });
 }

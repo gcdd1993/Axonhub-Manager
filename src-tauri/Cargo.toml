@@ -1,6 +1,6 @@
 [package]
 name = "axonhub-manager"
-version = "0.0.2"
+version = "0.0.3"
 description = "Native desktop lifecycle manager for AxonHub"
 authors = ["AxonHub Manager contributors"]
 edition = "2021"
